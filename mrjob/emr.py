@@ -877,6 +877,13 @@ class EMRJobRunner(MRJobRunner):
             s3_key = self.make_s3_key(s3_uri, s3_conn)
             s3_key.set_contents_from_filename(path)
 
+    def asana_bind_host(self):
+      if(os.getenv("CONFIG") == "prod"):
+        return "report.asana.com"
+      if(os.getenv("CONFIG") == "stag"):
+        return "stag-report.asana.com"
+      return socket.getfqdn()
+
     def setup_ssh_tunnel_to_job_tracker(self, host):
         """setup the ssh tunnel to the job tracker, if it's not currently
         running.
@@ -946,7 +953,7 @@ class EMRJobRunner(MRJobRunner):
             log.warning('Failed to open ssh tunnel to job tracker')
         else:
             if self._opts['ssh_tunnel_is_open']:
-                bind_host = socket.getfqdn()
+                bind_host = self.asana_bind_host()
             else:
                 bind_host = 'localhost'
             self._tracker_url = 'http://%s:%d%s' % (
