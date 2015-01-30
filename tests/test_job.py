@@ -39,6 +39,8 @@ from mrjob.protocol import JSONValueProtocol
 from mrjob.protocol import PickleProtocol
 from mrjob.protocol import RawValueProtocol
 from mrjob.protocol import ReprProtocol
+from mrjob.step import _IDENTITY_MAPPER
+from mrjob.step import _IDENTITY_REDUCER
 from mrjob.step import JarStep
 from mrjob.step import MRStep
 from mrjob.util import log_to_stream
@@ -48,6 +50,7 @@ from tests.mr_two_step_job import MRTwoStepJob
 from tests.quiet import logger_disabled
 from tests.quiet import no_handlers_for_logger
 from tests.sandbox import EmptyMrjobConfTestCase
+from tests.sandbox import mrjob_conf_patcher
 from tests.sandbox import SandboxedTestCase
 
 
@@ -157,9 +160,6 @@ class CountersAndStatusTestCase(unittest.TestCase):
                                        'Sorting metasyntactic variables...'],
                           'other': []})
 
-        # make sure parse_counters() works
-        self.assertEqual(mr_job.parse_counters(), parsed_stderr['counters'])
-
     def test_unicode_set_status(self):
         mr_job = MRJob().sandbox()
         # shouldn't raise an exception
@@ -178,7 +178,8 @@ class CountersAndStatusTestCase(unittest.TestCase):
         mr_job.increment_counter('Foo', 'Baz', -1)
         mr_job.increment_counter('Qux', 'Quux', 0)
 
-        self.assertEqual(mr_job.parse_counters(),
+        parsed_stderr = parse_mr_job_stderr(mr_job.stderr.getvalue())
+        self.assertEqual(parsed_stderr['counters'],
                          {'Foo': {'Bar': -1, 'Baz': 0}, 'Qux': {'Quux': 0}})
 
     def test_bad_counter_amounts(self):
@@ -196,7 +197,8 @@ class CountersAndStatusTestCase(unittest.TestCase):
         mr_job.increment_counter('Bad items', 'a, b, c')
         mr_job.increment_counter('girl, interrupted', 'movie')
 
-        self.assertEqual(mr_job.parse_counters(),
+        parsed_stderr = parse_mr_job_stderr(mr_job.stderr.getvalue())
+        self.assertEqual(parsed_stderr['counters'],
                          {'Bad items': {'a; b; c': 1},
                           'girl; interrupted': {'movie': 1}})
 
@@ -296,63 +298,107 @@ class ProtocolsTestCase(unittest.TestCase):
                           "None\t'bar'\n" +
                           "None\t'baz'\n"))
 
+
+class StrictProtocolsTestCase(EmptyMrjobConfTestCase):
+
+    class MRBoringJSONJob(MRJob):
+        INPUT_PROTOCOL = JSONProtocol
+
+        def reducer(self, key, values):
+            yield(key, list(values))
+
+    BAD_JSON_INPUT = ('BAD\tJSON\n' +
+                      '"foo"\t"bar"\n' +
+                      '"too"\t"many"\t"tabs"\n' +
+                      '"notabs"\n')
+
+    UNENCODABLE_RAW_INPUT = ('foo\n' +
+                             '\xaa\n' +
+                             'bar\n')
+
+    STRICT_MRJOB_CONF ={'runners': {'inline': {'strict_protocols': True}}}
+
+    def assertJobHandlesUndecodableInput(self, job_args):
+        job = self.MRBoringJSONJob(job_args)
+        job.sandbox(stdin=StringIO(self.BAD_JSON_INPUT))
+
+        with job.make_runner() as r:
+            r.run()
+
+            # good data should still get through
+            self.assertEqual(''.join(r.stream_output()), '"foo"\t["bar"]\n')
+
+            # exception type varies between versions of json/simplejson,
+            # so just make sure there were three exceptions of some sort
+            counters = r.counters()[0]
+            self.assertEqual(counters.keys(), ['Undecodable input'])
+            self.assertEqual(
+                sum(counters['Undecodable input'].itervalues()), 3)
+
+    def assertJobRaisesExceptionOnUndecodableInput(self, job_args):
+        job = self.MRBoringJSONJob(job_args)
+        job.sandbox(stdin=StringIO(self.BAD_JSON_INPUT))
+
+        with job.make_runner() as r:
+            self.assertRaises(Exception, r.run)
+
+    def assertJobHandlesUnencodableOutput(self, job_args):
+        job = MRBoringJob(job_args)
+        job.sandbox(stdin=StringIO(self.UNENCODABLE_RAW_INPUT))
+
+        with job.make_runner() as r:
+            r.run()
+
+            # good data should still get through
+            self.assertEqual(''.join(r.stream_output()),
+                             'null\t["bar", "foo"]\n')
+
+            # exception type varies between versions of json/simplejson,
+            # so just make sure there were three exceptions of some sort
+            counters = r.counters()[0]
+            self.assertEqual(counters,
+                             {'Unencodable output': {'UnicodeDecodeError': 1}})
+
+    def assertJobRaisesExceptionOnUnencodableOutput(self, job_args):
+        job = MRBoringJob(job_args)
+        job.sandbox(stdin=StringIO(self.UNENCODABLE_RAW_INPUT))
+
+        with job.make_runner() as r:
+            self.assertRaises(Exception, r.run)
+
     def test_undecodable_input(self):
-        BAD_JSON_INPUT = StringIO('BAD\tJSON\n' +
-                                  '"foo"\t"bar"\n' +
-                                  '"too"\t"many"\t"tabs"\n' +
-                                  '"notabs"\n')
-
-        mr_job = MRBoringJob(args=['--reducer'])
-        mr_job.sandbox(stdin=BAD_JSON_INPUT)
-        mr_job.run_reducer()
-
-        # good data should still get through
-        self.assertEqual(mr_job.stdout.getvalue(), '"foo"\t["bar"]\n')
-
-        # exception type varies between versions of simplejson,
-        # so just make sure there were three exceptions of some sort
-        counters = mr_job.parse_counters()
-        self.assertEqual(counters.keys(), ['Undecodable input'])
-        self.assertEqual(sum(counters['Undecodable input'].itervalues()), 3)
+        self.assertJobHandlesUndecodableInput(job_args=[])
 
     def test_undecodable_input_strict(self):
-        BAD_JSON_INPUT = StringIO('BAD\tJSON\n' +
-                                  '"foo"\t"bar"\n' +
-                                  '"too"\t"many"\t"tabs"\n' +
-                                  '"notabs"\n')
+        self.assertJobRaisesExceptionOnUndecodableInput(
+            job_args=['--strict-protocols'])
 
-        mr_job = MRBoringJob(args=['--reducer', '--strict-protocols'])
-        mr_job.sandbox(stdin=BAD_JSON_INPUT)
+    def test_undecodable_input_strict_in_mrjob_conf(self):
+        with mrjob_conf_patcher(self.STRICT_MRJOB_CONF):
+            self.assertJobRaisesExceptionOnUndecodableInput(
+                job_args=['--strict-protocols'])
 
-        # make sure it raises an exception
-        self.assertRaises(Exception, mr_job.run_reducer)
+    def test_undecodable_input_no_strict_protocols(self):
+        with mrjob_conf_patcher(self.STRICT_MRJOB_CONF):
+            self.assertJobHandlesUndecodableInput(
+                job_args=['--no-strict-protocols'])
 
     def test_unencodable_output(self):
-        UNENCODABLE_RAW_INPUT = StringIO('foo\n' +
-                                         '\xaa\n' +
-                                         'bar\n')
+        self.assertJobHandlesUnencodableOutput(job_args=[])
 
-        mr_job = MRBoringJob(args=['--mapper'])
-        mr_job.sandbox(stdin=UNENCODABLE_RAW_INPUT)
-        mr_job.run_mapper()
+    def test_unencodable_output_strict(self):
+        self.assertJobRaisesExceptionOnUnencodableOutput(
+            job_args=['--strict-protocols'])
 
-        # good data should still get through
-        self.assertEqual(mr_job.stdout.getvalue(),
-                         ('null\t"foo"\n' + 'null\t"bar"\n'))
+    def test_unencodable_output_strict_in_mrjob_conf(self):
+        with mrjob_conf_patcher(self.STRICT_MRJOB_CONF):
+            self.assertJobRaisesExceptionOnUnencodableOutput(
+                job_args=['--strict-protocols'])
 
-        self.assertEqual(mr_job.parse_counters(),
-                         {'Unencodable output': {'UnicodeDecodeError': 1}})
-
-    def test_undecodable_output_strict(self):
-        UNENCODABLE_RAW_INPUT = StringIO('foo\n' +
-                                         '\xaa\n' +
-                                         'bar\n')
-
-        mr_job = MRBoringJob(args=['--mapper', '--strict-protocols'])
-        mr_job.sandbox(stdin=UNENCODABLE_RAW_INPUT)
-
-        # make sure it raises an exception
-        self.assertRaises(Exception, mr_job.run_mapper)
+    def test_unencodable_output_no_strict_protocols(self):
+        with mrjob_conf_patcher(self.STRICT_MRJOB_CONF):
+            self.assertJobHandlesUnencodableOutput(
+                job_args=['--no-strict-protocols'])
 
 
 class PickProtocolsTestCase(unittest.TestCase):
@@ -405,39 +451,34 @@ class PickProtocolsTestCase(unittest.TestCase):
                         self.assertIsInstance(actual_read, expect_read)
                         self.assertIsInstance(actual_write, expect_write)
 
-    def _streaming_step(self, n, *args, **kwargs):
-        return MRStep(*args, **kwargs).description(n)
-
-    def _jar_step(self, n, *args, **kwargs):
-        return JarStep(*args, **kwargs).description(n)
-
     def test_single_mapper(self):
         self._assert_script_protocols(
-            [self._streaming_step(0, mapper=self._yield_none)],
+            [MRStep(mapper=self._yield_none).description(0)],
             [(PickleProtocol, JSONValueProtocol)],
             strict_protocols=True)
 
     def test_single_reducer(self):
         # MRStep transparently adds mapper
         self._assert_script_protocols(
-            [self._streaming_step(0, reducer=self._yield_none)],
+            [MRStep(reducer=self._yield_none).description(0)],
             [(PickleProtocol, JSONProtocol),
              (JSONProtocol, JSONValueProtocol)],
             strict_protocols=True)
 
     def test_mapper_combiner(self):
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper=self._yield_none, combiner=self._yield_none)],
+            [MRStep(mapper=self._yield_none,
+                    combiner=self._yield_none).description(0)],
             [(PickleProtocol, JSONValueProtocol),
              (JSONValueProtocol, JSONValueProtocol)],
             strict_protocols=True)
 
     def test_mapper_combiner_reducer(self):
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper=self._yield_none, combiner=self._yield_none,
-                reducer=self._yield_none)],
+            [MRStep(
+                mapper=self._yield_none,
+                combiner=self._yield_none,
+                reducer=self._yield_none).description(0)],
             [(PickleProtocol, JSONProtocol),
              (JSONProtocol, JSONProtocol),
              (JSONProtocol, JSONValueProtocol)],
@@ -445,10 +486,11 @@ class PickProtocolsTestCase(unittest.TestCase):
 
     def test_begin_jar_step(self):
         self._assert_script_protocols(
-            [self._jar_step(0, 'blah', 'binks_jar.jar'),
-             self._streaming_step(
-                 1, mapper=self._yield_none, combiner=self._yield_none,
-                 reducer=self._yield_none)],
+            [JarStep(jar='binks_jar.jar').description(0),
+             MRStep(
+                 mapper=self._yield_none,
+                 combiner=self._yield_none,
+                 reducer=self._yield_none).description(1)],
             [(RawValueProtocol, RawValueProtocol),
              (PickleProtocol, JSONProtocol),
              (JSONProtocol, JSONProtocol),
@@ -456,10 +498,11 @@ class PickProtocolsTestCase(unittest.TestCase):
 
     def test_end_jar_step(self):
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper=self._yield_none, combiner=self._yield_none,
-                reducer=self._yield_none),
-             self._jar_step(1, 'blah', 'binks_jar.jar')],
+            [MRStep(
+                mapper=self._yield_none,
+                combiner=self._yield_none,
+                reducer=self._yield_none).description(0),
+             JarStep(jar='binks_jar.jar').description(1)],
             [(PickleProtocol, JSONProtocol),
              (JSONProtocol, JSONProtocol),
              (JSONProtocol, JSONValueProtocol),
@@ -467,10 +510,11 @@ class PickProtocolsTestCase(unittest.TestCase):
 
     def test_middle_jar_step(self):
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper=self._yield_none, combiner=self._yield_none),
-             self._jar_step(1, 'blah', 'binks_jar.jar'),
-             self._streaming_step(2, reducer=self._yield_none)],
+            [MRStep(
+                mapper=self._yield_none,
+                combiner=self._yield_none).description(0),
+             JarStep(jar='binks_jar.jar').description(1),
+             MRStep(reducer=self._yield_none).description(2)],
             [(PickleProtocol, JSONProtocol),
              (JSONProtocol, JSONProtocol),
              (RawValueProtocol, RawValueProtocol),
@@ -478,13 +522,14 @@ class PickProtocolsTestCase(unittest.TestCase):
 
     def test_single_mapper_cmd(self):
         self._assert_script_protocols(
-            [self._streaming_step(0, mapper_cmd='cat')],
+            [MRStep(mapper_cmd='cat').description(0)],
             [(RawValueProtocol, RawValueProtocol)])
 
     def test_single_mapper_cmd_with_script_combiner(self):
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper_cmd='cat', combiner=self._yield_none)],
+            [MRStep(
+                mapper_cmd='cat',
+                combiner=self._yield_none).description(0)],
             [(RawValueProtocol, RawValueProtocol),
              (RawValueProtocol, RawValueProtocol)])
 
@@ -492,8 +537,9 @@ class PickProtocolsTestCase(unittest.TestCase):
         # reducer is only script step so it uses INPUT_PROTOCOL and
         # OUTPUT_PROTOCOL
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper_cmd='cat', reducer=self._yield_none)],
+            [MRStep(
+                mapper_cmd='cat',
+                reducer=self._yield_none).description(0)],
             [(RawValueProtocol, RawValueProtocol),
              (PickleProtocol, JSONValueProtocol)])
 
@@ -501,10 +547,10 @@ class PickProtocolsTestCase(unittest.TestCase):
         # reducer is only script step so it uses INPUT_PROTOCOL and
         # OUTPUT_PROTOCOL
         self._assert_script_protocols(
-            [self._streaming_step(
-                0, mapper_cmd='cat', reducer=self._yield_none),
-             self._jar_step(1, 'blah', 'binks_jar.jar'),
-             self._streaming_step(2, mapper=self._yield_none)],
+            [MRStep(mapper_cmd='cat',
+                    reducer=self._yield_none).description(0),
+             JarStep(jar='binks_jar.jar').description(1),
+             MRStep(mapper=self._yield_none).description(2)],
             [(RawValueProtocol, RawValueProtocol),
              (PickleProtocol, JSONProtocol),
              (RawValueProtocol, RawValueProtocol),
@@ -797,9 +843,9 @@ class StepNumTestCase(unittest.TestCase):
         def test_mapper0(mr_job, input_lines):
             mr_job.sandbox(input_lines)
             mr_job.run_mapper(0)
-            self.assertEqual(mr_job.parse_output(),
-                             [(None, 'foo'), ('foo', None),
-                              (None, 'bar'), ('bar', None)])
+            self.assertEqual(mr_job.stdout.getvalue(),
+                             'null\t"foo"\n' + '"foo"\tnull\n' +
+                             'null\t"bar"\n' + '"bar"\tnull\n')
 
         mapper0 = MRTwoStepJob()
         test_mapper0(mapper0, mapper0_input_lines)
@@ -816,8 +862,8 @@ class StepNumTestCase(unittest.TestCase):
         def test_reducer0(mr_job, input_lines):
             mr_job.sandbox(input_lines)
             mr_job.run_reducer(0)
-            self.assertEqual(mr_job.parse_output(),
-                             [('bar', 1), ('foo', 1), (None, 2)])
+            self.assertEqual(mr_job.stdout.getvalue(),
+                             '"bar"\t1\n' + '"foo"\t1\n' + 'null\t2\n')
 
         reducer0 = MRTwoStepJob()
         test_reducer0(reducer0, reducer0_input_lines)
@@ -832,8 +878,8 @@ class StepNumTestCase(unittest.TestCase):
         def test_mapper1(mr_job, input_lines):
             mr_job.sandbox(input_lines)
             mr_job.run_mapper(1)
-            self.assertEqual(mr_job.parse_output(),
-                             [(1, 'bar'), (1, 'foo'), (2, None)])
+            self.assertEqual(mr_job.stdout.getvalue(),
+                             '1\t"bar"\n' + '1\t"foo"\n' + '2\tnull\n')
 
         mapper1 = MRTwoStepJob()
         test_mapper1(mapper1, mapper1_input_lines)
@@ -880,29 +926,40 @@ class FileOptionsTestCase(SandboxedTestCase):
         self.assertEqual(set(output), set([0, 1, ((2 ** 3) ** 3) ** 3]))
 
 
-class ParseOutputTestCase(unittest.TestCase):
-    # test parse_output() method
+class DeprecatedTestMethodsTestCase(unittest.TestCase):
 
-    def test_default(self):
+    def test_parse_output(self):
         # test parsing JSON
         mr_job = MRJob()
         output = '0\t1\n"a"\t"b"\n'
         mr_job.stdout = StringIO(output)
-        self.assertEqual(mr_job.parse_output(), [(0, 1), ('a', 'b')])
+        with logger_disabled('mrjob.job'):
+            self.assertEqual(mr_job.parse_output(), [(0, 1), ('a', 'b')])
 
         # verify that stdout is not cleared
         self.assertEqual(mr_job.stdout.getvalue(), output)
 
-    def test_protocol_instance(self):
+    def test_parse_output_with_protocol_instance(self):
         # see if we can use the repr protocol
         mr_job = MRJob()
         output = "0\t1\n['a', 'b']\tset(['c', 'd'])\n"
         mr_job.stdout = StringIO(output)
-        self.assertEqual(mr_job.parse_output(ReprProtocol()),
-                         [(0, 1), (['a', 'b'], set(['c', 'd']))])
+        with logger_disabled('mrjob.job'):
+            self.assertEqual(mr_job.parse_output(ReprProtocol()),
+                             [(0, 1), (['a', 'b'], set(['c', 'd']))])
 
         # verify that stdout is not cleared
         self.assertEqual(mr_job.stdout.getvalue(), output)
+
+    def test_parse_counters(self):
+        mr_job = MRJob().sandbox()
+
+        mr_job.increment_counter('Foo', 'Bar')
+        mr_job.increment_counter('Foo', 'Bar')
+        mr_job.increment_counter('Foo', 'Baz', 20)
+
+        self.assertEqual(mr_job.parse_counters(),
+                         {'Foo': {'Bar': 2, 'Baz': 20}})
 
 
 class RunJobTestCase(SandboxedTestCase):
@@ -1009,8 +1066,8 @@ class StepsTestCase(unittest.TestCase):
 
         def steps(self):
             return [
-                self.mr(mapper_init=self._yield_none, mapper_pre_filter='cat',
-                        reducer_cmd='wc -l'),
+                MRStep(mapper_init=self._yield_none, mapper_pre_filter='cat',
+                       reducer_cmd='wc -l'),
                 JarStep(jar='s3://bookat/binks_jar.jar')]
 
     class SingleSteppyCommandJob(MRJob):
@@ -1064,3 +1121,31 @@ class StepsTestCase(unittest.TestCase):
         self.assertEqual(
             j.steps()[0],
             MRStep(mapper=j.mapper))
+
+
+class DeprecatedStepConstructorMethodsTestCase(unittest.TestCase):
+
+    def test_jar(self):
+        kwargs = {
+            'jar': 'binks.jar.jar',
+            'main_class': 'MyMainMan',
+            'args': ['argh', 'argh'],
+        }
+
+        with logger_disabled('mrjob.job'):
+            self.assertEqual(MRJob.jar(**kwargs), JarStep(**kwargs))
+
+    def test_mr(self):
+        kwargs = {
+            'mapper': _IDENTITY_MAPPER,
+            'reducer': _IDENTITY_REDUCER,
+        }
+
+        with logger_disabled('mrjob.job'):
+            self.assertEqual(MRJob.mr(**kwargs), MRStep(**kwargs))
+
+    def test_mr_positional_arguments(self):
+        with logger_disabled('mrjob.job'):
+            self.assertEqual(
+                MRJob.mr(_IDENTITY_MAPPER, _IDENTITY_REDUCER),
+                MRStep(mapper=_IDENTITY_MAPPER, reducer=_IDENTITY_REDUCER))

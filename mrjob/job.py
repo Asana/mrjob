@@ -348,47 +348,15 @@ class MRJob(MRJobLauncher):
 
     @classmethod
     def mr(cls, *args, **kwargs):
-        """Define a Python step (mapper, reducer, and/or any combination of
-        mapper_init, reducer_final, etc.) for your job.
-
-        Used by :py:meth:`steps`. (Don't re-define this, just call it!)
-        See :ref:`writing-multi-step-jobs` for sample usage.
-
-        Accepts the following keyword arguments.
-
-        :param mapper: function with same function signature as
-                       :py:meth:`mapper`, or ``None`` for an identity mapper.
-        :param reducer: function with same function signature as
-                        :py:meth:`reducer`, or ``None`` for no reducer.
-        :param combiner: function with same function signature as
-                         :py:meth:`combiner`, or ``None`` for no combiner.
-        :param mapper_init: function with same function signature as
-                            :py:meth:`mapper_init`, or ``None`` for no initial
-                            mapper action.
-        :param mapper_final: function with same function signature as
-                             :py:meth:`mapper_final`, or ``None`` for no final
-                             mapper action.
-        :param reducer_init: function with same function signature as
-                             :py:meth:`reducer_init`, or ``None`` for no
-                             initial reducer action.
-        :param reducer_final: function with same function signature as
-                              :py:meth:`reducer_final`, or ``None`` for no
-                              final reducer action.
-        :param combiner_init: function with same function signature as
-                              :py:meth:`combiner_init`, or ``None`` for no
-                              initial combiner action.
-        :param combiner_final: function with same function signature as
-                               :py:meth:`combiner_final`, or ``None`` for no
-                               final combiner action.
-        :param jobconf: dictionary with custom jobconf arguments to pass to
-                        hadoop.
-
-        This is just a wrapper for :py:class:`~mrjob.step.MRStep`, plus
+        """A deprecated wrapper for :py:class:`~mrjob.step.MRStep`, plus
         a little logic to support deprecated use of positional arguments.
         """
         if args:
             log.warning('Using positional arguments to MRJob.mr() is'
                         ' deprecated and will be removed in v0.5.0')
+        else:
+            log.warning('mr() is deprecated and will be removed in v0.6.0.'
+                        ' Use mrjob.step.MRStep directly instead.')
 
         if len(args) > 0:
             kwargs['mapper'] = args[0]
@@ -1179,43 +1147,45 @@ class MRJob(MRJobLauncher):
     ### Testing ###
 
     def parse_counters(self, counters=None):
-        """Convenience method for reading counters. This only works
-        in sandbox mode. This does not clear ``self.stderr``.
+        """.. deprecated:: 0.4.2
 
-        :return: a map from counter group to counter name to amount.
+        Parse the counters from the given sandboxed job's ``self.stderr``;
+        superseded :py:func:`mrjob.parse.parse_mr_job_stderr`.
 
-        To read everything from ``self.stderr`` (including status messages)
-        use :py:meth:`mrjob.parse.parse_mr_job_stderr`.
-
-        When writing unit tests, you may find :py:meth:`MRJobRunner.counters()
-        <mrjob.runner.MRJobRunner.counters()>` more useful.
+        This was only useful for testing individual mappers/reducers
+        without a runner; normally you'd just use
+        :py:meth:`runner.counters() <mrjob.runner.MRJobRunner.counters()>`.
         """
         if self.stderr == sys.stderr:
             raise AssertionError('You must call sandbox() first;'
                                  ' parse_counters() is for testing only.')
 
+        log.warning(
+            'parse_counters() is deprecated and will be removed in v0.5.0')
+
         stderr_results = parse_mr_job_stderr(self.stderr.getvalue(), counters)
         return stderr_results['counters']
 
     def parse_output(self, protocol=None):
-        """Convenience method for parsing output from any mapper or reducer,
-        all at once.
+        """.. deprecated:: 0.4.2
 
-        This helps you test individual mappers and reducers by calling
-        run_mapper() or run_reducer(). For example::
+        Parse the output from the given sandboxed job's ``self.stdout``.
 
-            mr_job.sandbox(stdin=your_input)
-            mr_job.run_mapper(step_num=0)
-            output = mrjob.parse_output()
+        This was only useful for testing individual mappers/reducers
+        without using a runner; normally you'd just use
+        :py:meth:`runner.stream_output()
+        <mrjob.runner.MRJobRunner.stream_output()>`
 
         :type protocol: protocol
-        :param protocol: A protocol instance to use (e.g. JSONProtocol()),
-
-        This only works in sandbox mode. This does not clear ``self.stdout``.
+        :param protocol: A protocol instance to use. Defaults to
+                         ``JSONProtocol()``.
         """
         if self.stdout == sys.stdout:
             raise AssertionError('You must call sandbox() first;'
                                  ' parse_output() is for testing only.')
+
+        log.warning(
+            'parse_output() is deprecated and will be removed in v0.5.0')
 
         if protocol is None:
             protocol = JSONProtocol()
